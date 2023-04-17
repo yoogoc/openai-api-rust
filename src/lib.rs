@@ -128,11 +128,32 @@ pub mod api {
     }
 
     impl TryFrom<CompletionArgsBuilder> for CompletionArgs {
-        type Error = String;
+        type Error = CompletionArgsBuilderError;
 
         fn try_from(builder: CompletionArgsBuilder) -> Result<Self, Self::Error> {
             builder.build()
         }
+    }
+
+    #[derive(Serialize, Debug, Builder, Clone)]
+    #[builder(pattern = "immutable")]
+    pub struct EmbeddingsArgs {
+        model: String,
+        input: String,
+        // user: Option<String>,
+    }
+
+    impl EmbeddingsArgs {
+        /// Build a `EmbeddingsArgs` from the defaults
+        #[must_use]
+        pub fn builder() -> EmbeddingsArgsBuilder {
+            EmbeddingsArgsBuilder::default()
+        }
+    }
+
+    #[derive(Deserialize, Debug, Clone)]
+    pub struct Embeddings {
+        pub embedding: Vec<f32>,
     }
 
     /// Represents a non-streamed completion response
@@ -215,10 +236,12 @@ pub enum Error {
     /// Network / protocol related errors
     #[cfg(feature = "async")]
     #[error("Error at the protocol level: {0}")]
-    AsyncProtocol(surf::Error),
+    AsyncProtocol(reqwest::Error),
     #[cfg(feature = "sync")]
     #[error("Error at the protocol level, sync client")]
     SyncProtocol(ureq::Error),
+    #[error("Error at the CompletionArgsBuilder, level:{0}")]
+    Build(crate::api::CompletionArgsBuilderError),
 }
 
 impl From<api::ErrorMessage> for Error {
@@ -234,8 +257,8 @@ impl From<String> for Error {
 }
 
 #[cfg(feature = "async")]
-impl From<surf::Error> for Error {
-    fn from(e: surf::Error) -> Self {
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
         Error::AsyncProtocol(e)
     }
 }
@@ -244,6 +267,12 @@ impl From<surf::Error> for Error {
 impl From<ureq::Error> for Error {
     fn from(e: ureq::Error) -> Self {
         Error::SyncProtocol(e)
+    }
+}
+
+impl From<crate::api::CompletionArgsBuilderError> for Error {
+    fn from(e: crate::api::CompletionArgsBuilderError) -> Self {
+        Error::Build(e)
     }
 }
 
@@ -266,51 +295,33 @@ impl std::fmt::Debug for BearerToken {
 }
 
 #[cfg(feature = "async")]
-impl BearerToken {
-    fn new(token: &str) -> Self {
-        Self {
-            token: String::from(token),
-        }
-    }
-}
-
-#[cfg(feature = "async")]
-#[surf::utils::async_trait]
-impl surf::middleware::Middleware for BearerToken {
-    async fn handle(
-        &self,
-        mut req: surf::Request,
-        client: surf::Client,
-        next: surf::middleware::Next<'_>,
-    ) -> surf::Result<surf::Response> {
-        log::debug!("Request: {:?}", req);
-        req.insert_header("Authorization", format!("Bearer {}", self.token));
-        let response: surf::Response = next.run(req, client).await?;
-        log::debug!("Response: {:?}", response);
-        Ok(response)
-    }
-}
-
-#[cfg(feature = "async")]
-fn async_client(token: &str, base_url: &str) -> surf::Client {
-    let mut async_client = surf::client();
-    async_client.set_base_url(surf::Url::parse(base_url).expect("Static string should parse"));
-    async_client.with(BearerToken::new(token))
+fn async_client(token: &str) -> reqwest::Client {
+    let builder = reqwest::ClientBuilder::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_bytes(format!("Bearer {}", token).as_bytes()).expect(""),
+    );
+    builder.default_headers(headers).build().expect("")
 }
 
 #[cfg(feature = "sync")]
 fn sync_client(token: &str) -> ureq::Agent {
-    ureq::agent().auth_kind("Bearer", token).build()
+    let token = String::from(token);
+    ureq::AgentBuilder::new()
+        .middleware(move |req: ureq::Request, next: ureq::MiddlewareNext| {
+            next.handle(req.set("authorization", &token))
+        })
+        .build()
 }
 
 /// Client object. Must be constructed to talk to the API.
 #[derive(Debug, Clone)]
 pub struct Client {
     #[cfg(feature = "async")]
-    async_client: surf::Client,
+    async_client: reqwest::Client,
     #[cfg(feature = "sync")]
     sync_client: ureq::Agent,
-    #[cfg(feature = "sync")]
     base_url: String,
 }
 
@@ -321,27 +332,16 @@ impl Client {
         let base_url: String = "https://api.openai.com/v1/".into();
         Self {
             #[cfg(feature = "async")]
-            async_client: async_client(token, &base_url),
+            async_client: async_client(token),
             #[cfg(feature = "sync")]
             sync_client: sync_client(token),
-            #[cfg(feature = "sync")]
             base_url,
         }
     }
 
-    // Allow setting the api root in the tests
-    #[cfg(test)]
-    fn set_api_root(mut self, base_url: &str) -> Self {
-        #[cfg(feature = "async")]
-        {
-            self.async_client.set_base_url(
-                surf::Url::parse(base_url).expect("static URL expected to parse correctly"),
-            );
-        }
-        #[cfg(feature = "sync")]
-        {
-            self.base_url = String::from(base_url);
-        }
+    // Allow setting the api root
+    pub fn set_api_root(mut self, base_url: &str) -> Self {
+        self.base_url = String::from(base_url);
         self
     }
 
@@ -351,11 +351,15 @@ impl Client {
     where
         T: serde::de::DeserializeOwned,
     {
-        let mut response = self.async_client.get(endpoint).await?;
-        if let surf::StatusCode::Ok = response.status() {
-            Ok(response.body_json::<T>().await?)
+        let response = self
+            .async_client
+            .get(&format!("{}{}", self.base_url, endpoint))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(response.json().await?)
         } else {
-            let err = response.body_json::<api::ErrorWrapper>().await?.error;
+            let err = response.json::<api::ErrorWrapper>().await?.error;
             Err(Error::Api(err))
         }
     }
@@ -368,14 +372,14 @@ impl Client {
         let response = dbg!(self
             .sync_client
             .get(&format!("{}{}", self.base_url, endpoint)))
-        .call();
+        .call()?;
         if let 200 = response.status() {
             Ok(response
-                .into_json_deserialize()
+                .into_json()
                 .expect("Bug: client couldn't deserialize api response"))
         } else {
             let err = response
-                .into_json_deserialize::<api::ErrorWrapper>()
+                .into_json::<api::ErrorWrapper>()
                 .expect("Bug: client couldn't deserialize api error response")
                 .error;
             Err(Error::Api(err))
@@ -428,20 +432,22 @@ impl Client {
         B: serde::ser::Serialize,
         R: serde::de::DeserializeOwned,
     {
-        let mut response = self
+        let response = self
             .async_client
-            .post(endpoint)
-            .body(surf::Body::from_json(&body)?)
+            .post(&format!("{}{}", self.base_url, endpoint))
+            .json(&body)
+            .send()
             .await?;
-        match response.status() {
-            surf::StatusCode::Ok => Ok(response.body_json::<R>().await?),
-            _ => Err(Error::Api(
+        if response.status().is_success() {
+            Ok(response.json::<R>().await?)
+        } else {
+            Err(Error::Api(
                 response
-                    .body_json::<api::ErrorWrapper>()
+                    .json::<api::ErrorWrapper>()
                     .await
                     .expect("The API has returned something funky")
                     .error,
-            )),
+            ))
         }
     }
 
@@ -456,14 +462,14 @@ impl Client {
             .post(&format!("{}{}", self.base_url, endpoint))
             .send_json(
                 serde_json::to_value(body).expect("Bug: client couldn't serialize its own type"),
-            );
+            )?;
         match response.status() {
             200 => Ok(response
-                .into_json_deserialize()
+                .into_json()
                 .expect("Bug: client couldn't deserialize api response")),
             _ => Err(Error::Api(
                 response
-                    .into_json_deserialize::<api::ErrorWrapper>()
+                    .into_json::<api::ErrorWrapper>()
                     .expect("Bug: client couldn't deserialize api error response")
                     .error,
             )),
@@ -496,6 +502,27 @@ impl Client {
     ) -> Result<api::Completion> {
         let args = prompt.into();
         self.post_sync(&format!("engines/{}/completions", args.engine), args)
+    }
+
+    #[cfg(feature = "async")]
+    pub async fn embeddings(
+        &self,
+        prompt: impl Into<api::EmbeddingsArgs>,
+    ) -> Result<Vec<api::Embeddings>> {
+        let args = prompt.into();
+        Ok(self
+            .post::<api::EmbeddingsArgs, api::Container<api::Embeddings>>("embeddings", args)
+            .await?
+            .data)
+    }
+
+    #[cfg(feature = "sync")]
+    pub fn embeddings_sync(
+        &self,
+        prompt: impl Into<api::EmbeddingsArgs>,
+    ) -> Result<api::Embeddings> {
+        let args = prompt.into();
+        self.post_sync("embeddings", args)
     }
 }
 
@@ -535,14 +562,9 @@ mod unit {
         Client, Error,
     };
 
-    fn mocked_client() -> Client {
+    fn mocked_client(url: &str) -> Client {
         let _ = env_logger::builder().is_test(true).try_init();
-        Client::new("bogus").set_api_root(&format!("{}/", mockito::server_url()))
-    }
-
-    #[test]
-    fn can_create_client() {
-        let _c = mocked_client();
+        Client::new("bogus").set_api_root(&format!("{}/", url))
     }
 
     #[test]
@@ -565,8 +587,13 @@ mod unit {
         Ok(())
     }
 
-    fn mock_engines() -> (Mock, Vec<EngineInfo>) {
-        let mock = mockito::mock("GET", "/engines")
+    fn mock_server() -> mockito::ServerGuard {
+        mockito::Server::new()
+    }
+
+    fn mock_engines(server: &mut mockito::ServerGuard) -> (Mock, Vec<EngineInfo>) {
+        let mock = server
+            .mock("GET", "/engines")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -650,19 +677,22 @@ mod unit {
     }
 
     async_test!(parse_engines_async, {
-        let (_m, expected) = mock_engines();
-        let response = mocked_client().engines().await?;
+        let mut server = mock_server();
+        let (_m, expected) = mock_engines(&mut server);
+        let response = mocked_client(&server.url()).engines().await?;
         assert_eq!(response, expected);
     });
 
     sync_test!(parse_engines_sync, {
-        let (_m, expected) = mock_engines();
-        let response = mocked_client().engines_sync()?;
+        let mut server = mock_server();
+        let (_m, expected) = mock_engines(&mut server);
+        let response = mocked_client(&server.url()).engines_sync()?;
         assert_eq!(response, expected);
     });
 
-    fn mock_engine() -> (Mock, api::ErrorMessage) {
-        let mock = mockito::mock("GET", "/engines/davinci")
+    fn mock_engine(server: &mut mockito::ServerGuard) -> (Mock, api::ErrorMessage) {
+        let mock = server
+            .mock("GET", "/engines/davinci")
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(
@@ -683,22 +713,27 @@ mod unit {
     }
 
     async_test!(engine_error_response_async, {
-        let (_m, expected) = mock_engine();
-        let response = mocked_client().engine("davinci").await;
+        let mut server = mock_server();
+        let (_m, expected) = mock_engine(&mut server);
+        let response = mocked_client(&server.url()).engine("davinci").await;
         if let Result::Err(Error::Api(msg)) = response {
             assert_eq!(expected, msg);
         }
     });
 
     sync_test!(engine_error_response_sync, {
-        let (_m, expected) = mock_engine();
-        let response = mocked_client().engine_sync("davinci");
+        let mut server = mock_server();
+        let (_m, expected) = mock_engine(&mut server);
+        let response = mocked_client(&server.url()).engine_sync("davinci");
         if let Result::Err(Error::Api(msg)) = response {
             assert_eq!(expected, msg);
         }
     });
-    fn mock_completion() -> crate::Result<(Mock, CompletionArgs, Completion)> {
-        let mock = mockito::mock("POST", "/engines/davinci/completions")
+    fn mock_completion(
+        server: &mut mockito::ServerGuard,
+    ) -> crate::Result<(Mock, CompletionArgs, Completion)> {
+        let mock = server
+            .mock("POST", "/engines/davinci/completions")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -756,15 +791,17 @@ mod unit {
     }
 
     async_test!(completion_args_async, {
-        let (m, args, expected) = mock_completion()?;
-        let response = mocked_client().complete_prompt(args).await?;
+        let mut server = mock_server();
+        let (m, args, expected) = mock_completion(&mut server)?;
+        let response = mocked_client(&server.url()).complete_prompt(args).await?;
         assert_completion_equal(response, expected);
         m.assert();
     });
 
     sync_test!(completion_args_sync, {
-        let (m, args, expected) = mock_completion()?;
-        let response = mocked_client().complete_prompt_sync(args)?;
+        let mut server = mock_server();
+        let (m, args, expected) = mock_completion(&mut server)?;
+        let response = mocked_client(&server.url()).complete_prompt_sync(args)?;
         assert_completion_equal(response, expected);
         m.assert();
     });
